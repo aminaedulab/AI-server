@@ -1,0 +1,7 @@
+flask
+flask-cors
+transformers==4.40.2
+torch
+pdfplumber
+sentencepiece
+accelerate
