@@ -1,16 +1,8 @@
+import re
 import pdfplumber
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-
-MODEL_NAME = "sshleifer/distilbart-cnn-12-6"
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
 
 
-def extract_text_from_pdf(pdf_path):
+def extract_text_from_pdf(pdf_path: str) -> str:
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -20,36 +12,40 @@ def extract_text_from_pdf(pdf_path):
     return text.strip()
 
 
-def chunk_text(text, max_tokens=900):
-    tokens = tokenizer.encode(text)
-    chunks = []
-    for i in range(0, len(tokens), max_tokens):
-        chunk = tokens[i:i + max_tokens]
-        chunks.append(tokenizer.decode(chunk, skip_special_tokens=True))
-    return chunks
+def clean_text(text: str) -> str:
+    text = re.sub(r'[^\x00-\x7F]+', ' ', text)  # remove emojis
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
 
 
-def summarize_text(text, max_length=180, min_length=60):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024).to(device)
-    summary_ids = model.generate(
-        inputs["input_ids"],
-        max_length=max_length,
-        min_length=min_length,
-        num_beams=4,
-        early_stopping=True
-    )
-    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+def get_sentences(text: str) -> list:
+    return [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if len(s.strip()) > 40]
 
 
-def generate_pdf_summary(pdf_path):
+def summarize_by_extraction(text: str, max_sentences: int = 8) -> str:
+    """Extractive summarization — picks the most informative sentences."""
+    text = clean_text(text)
+    sentences = get_sentences(text)
+
+    # Score sentences by keyword density and position
+    words = re.findall(r'\b[a-z]{4,}\b', text.lower())
+    freq = {}
+    for w in words:
+        freq[w] = freq.get(w, 0) + 1
+
+    def score(sentence):
+        s_words = re.findall(r'\b[a-z]{4,}\b', sentence.lower())
+        return sum(freq.get(w, 0) for w in s_words) / (len(s_words) + 1)
+
+    scored = sorted(enumerate(sentences), key=lambda x: score(x[1]), reverse=True)
+    top = sorted(scored[:max_sentences], key=lambda x: x[0])  # restore original order
+
+    return " ".join(s for _, s in top)
+
+
+def generate_pdf_summary(pdf_path: str) -> str:
     text = extract_text_from_pdf(pdf_path)
-
     if not text:
         return "No readable text found in PDF."
-
-    chunks = chunk_text(text)
-    chunk_summaries = [summarize_text(chunk) for chunk in chunks]
-    combined = " ".join(chunk_summaries)
-
-    final_summary = summarize_text(combined, max_length=250, min_length=100)
-    return final_summary
+    return summarize_by_extraction(text)
