@@ -4,9 +4,28 @@ import random
 import requests
 import pdfplumber
 import io
+import spacy
+import logging
+
+from app.services.ml_service import (
+    generate_questions_t5,
+    semantic_distractors,
+    score_difficulty,
+)
+
+logger = logging.getLogger(__name__)
+nlp = spacy.load("en_core_web_sm")
+
+STOP_PATTERNS = re.compile(
+    r'(BEST WAY TO CREATE|Option \d|If You Want|WHY THIS|Tell me|'
+    r'PDF|Paste|Download|Click|Save As|reportlab|Python code)',
+    re.IGNORECASE
+)
+
+VAGUE_PRONOUNS = {"it", "this", "that", "they", "he", "she", "which", "these", "those"}
 
 
-def extract_text_from_path(pdf_path: str) -> str:
+def extract_text_from_path(pdf_path):
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -16,7 +35,7 @@ def extract_text_from_path(pdf_path: str) -> str:
     return text.strip()
 
 
-def extract_text_from_url(pdf_url: str) -> str:
+def extract_text_from_url(pdf_url):
     response = requests.get(pdf_url, timeout=30)
     response.raise_for_status()
     text = ""
@@ -28,187 +47,182 @@ def extract_text_from_url(pdf_url: str) -> str:
     return text.strip()
 
 
-def preprocess_text(text: str) -> str:
-    # Remove emojis and non-ASCII symbols
+def preprocess_text(text):
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
-    # Flatten newlines
     text = re.sub(r'\n+', ' ', text)
-    # Remove excessive whitespace
     text = re.sub(r'\s{2,}', ' ', text)
-    # Cut off promotional/meta content after common markers
-    cutoff = re.search(
-        r'(BEST WAY TO CREATE|Option 1|Option 2|If You Want|WHY THIS CONTENT|Tell me what)',
-        text, re.IGNORECASE
-    )
+    cutoff = STOP_PATTERNS.search(text)
     if cutoff:
         text = text[:cutoff.start()]
     return text.strip()
 
 
-def resolve_pronouns(sentences: list) -> list:
-    """Replace leading 'It/This/That' with the last identified subject."""
-    resolved = []
+def get_clean_sentences(text):
+    text = preprocess_text(text)
+    doc = nlp(text)
+    clean = []
     last_subject = None
 
-    for s in sentences:
-        # Try to find a subject from definition-style sentences
-        match = re.match(r'^([A-Z][A-Za-z\s]{3,30}?)\s+(?:is|are)\s+', s)
-        if match:
-            candidate = match.group(1).strip()
-            if candidate.lower() not in ("it", "this", "that", "he", "she", "they"):
-                last_subject = candidate
+    for sent in doc.sents:
+        s = sent.text.strip()
+        if len(s) < 30 or len(s) > 220:
+            continue
+        if re.match(r'^\d+\.', s):
+            continue
+        if len(s.split()) < 6:
+            continue
+        if STOP_PATTERNS.search(s):
+            continue
 
-        # Replace leading pronoun with last known subject
+        subj = None
+        for token in sent:
+            if token.dep_ in ("nsubj", "nsubjpass") and token.pos_ in ("NOUN", "PROPN"):
+                subj = token.text
+                break
+
+        if subj and subj.lower() not in VAGUE_PRONOUNS:
+            last_subject = subj
+
         if last_subject:
-            s = re.sub(r'^(It|This|That|They)\b', last_subject, s)
+            s = re.sub(r'^(It|This|That|They|These)\b', last_subject, s)
 
-        resolved.append(s)
-    return resolved
-
-
-def get_clean_sentences(text: str) -> list:
-    text = preprocess_text(text)
-    raw = re.split(r'(?<=[.!?])\s+', text)
-    clean = []
-    for s in raw:
-        s = s.strip()
-        if len(s) < 35 or len(s) > 180:
-            continue
-        if re.match(r'^\d+\.', s):          # starts with "1."
-            continue
-        if re.search(r'[:()]', s):           # headings or parenthetical noise
-            continue
-        if s.count(' ') < 5:                 # too few words
-            continue
-        if re.search(r'\b(PDF|Paste|Download|Click|Open|Save|Tell|Want)\b', s, re.IGNORECASE):
-            continue
         clean.append(s)
 
-    return resolve_pronouns(clean)
+    return clean
 
 
-def extract_keywords(text: str) -> list:
-    words = re.findall(r'\b[A-Za-z][a-z]{4,}\b', text)
+def extract_keywords(doc):
     freq = {}
-    for w in words:
-        freq[w.lower()] = freq.get(w.lower(), 0) + 1
+    for token in doc:
+        if token.pos_ in ("NOUN", "PROPN") and not token.is_stop and len(token.text) > 3:
+            w = token.lemma_.lower()
+            freq[w] = freq.get(w, 0) + 1
     sorted_words = sorted(freq, key=freq.get, reverse=True)
-    return [w.capitalize() for w in sorted_words[:60]]
+    return [w.capitalize() for w in sorted_words[:80]]
 
 
-def make_distractors(correct: str, keywords: list, n: int = 3) -> list:
-    distractors = []
-    for kw in keywords:
-        if kw.lower() not in correct.lower() and kw not in distractors:
-            distractors.append(kw)
-        if len(distractors) == n:
-            break
-    fallbacks = ["None of the above", "All of the above", "Not applicable"]
-    i = 0
-    while len(distractors) < n:
-        distractors.append(fallbacks[i % len(fallbacks)])
-        i += 1
-    return distractors
-
-
-def build_definition_question(sentence: str, keywords: list) -> dict | None:
-    match = re.match(
-        r'^([A-Z][^,\.]{3,40}?)\s+(?:is|are|refers to|means|defined as)\s+(.{15,120})$',
-        sentence, re.IGNORECASE
-    )
+def build_definition_question(sent, keywords):
+    text = sent.text.strip()
+    pattern = r'^([A-Z][^,\.]{3,40}?)\s+(?:is|are|refers to|means|defined as)\s+(.{15,120})$'
+    match = re.match(pattern, text, re.IGNORECASE)
     if not match:
         return None
 
     subject = match.group(1).strip()
     definition = match.group(2).strip().rstrip('.')
 
-    if subject.lower() in ("it", "this", "that", "he", "she", "they", "which"):
-        return None
-    if len(subject.split()) > 6:
+    if subject.lower() in VAGUE_PRONOUNS or len(subject.split()) > 6:
         return None
 
-    distractors = make_distractors(definition, keywords)
+    distractors = semantic_distractors(definition, keywords, n=3)
     options = distractors + [definition]
     random.shuffle(options)
     correct_label = next(chr(65 + i) for i, o in enumerate(options) if o == definition)
 
     return {
-        "question": f"What is {subject}?",
+        "question": "What is " + subject + "?",
         "options": [{"label": chr(65 + i), "text": o} for i, o in enumerate(options)],
         "correctAnswer": correct_label,
-        "correctAnswerText": definition
+        "correctAnswerText": definition,
+        "difficulty": score_difficulty(text),
+        "source": "rule",
     }
 
 
-def build_fill_blank_question(sentence: str, keywords: list) -> dict | None:
-    if len(sentence) > 160:
+def build_fill_blank_question(sent, keywords):
+    text = sent.text.strip()
+    if len(text) > 160:
         return None
 
-    words = sentence.split()
     candidates = [
-        (i, w) for i, w in enumerate(words)
-        if len(re.sub(r'\W', '', w)) > 4
-        and i not in (0, len(words) - 1)
-        and not re.sub(r'\W', '', w).isdigit()
-        and re.sub(r'\W', '', w).lower() not in (
-            "which", "their", "there", "these", "those", "about", "would", "could", "should"
-        )
+        token for token in sent
+        if token.pos_ in ("NOUN", "PROPN")
+        and not token.is_stop
+        and len(token.text) > 3
+        and token.i != sent.start
+        and token.i != sent.end - 1
+        and not token.text.isdigit()
+        and token.text.lower() not in VAGUE_PRONOUNS
     ]
+
     if not candidates:
         return None
 
-    idx, target = random.choice(candidates)
-    clean_target = re.sub(r'\W', '', target)
-    blanked = words[:idx] + ["______"] + words[idx + 1:]
-    question_text = " ".join(blanked)
+    target = random.choice(candidates)
+    blanked = (
+        text[:target.idx - sent.start_char]
+        + "______"
+        + text[target.idx - sent.start_char + len(target.text):]
+    ).strip()
 
-    distractors = make_distractors(clean_target, keywords)
-    options = distractors + [clean_target]
+    distractors = semantic_distractors(target.text, keywords, n=3)
+    options = distractors + [target.text]
     random.shuffle(options)
-    correct_label = next(chr(65 + i) for i, o in enumerate(options) if o == clean_target)
+    correct_label = next(chr(65 + i) for i, o in enumerate(options) if o == target.text)
 
     return {
-        "question": f"Fill in the blank: {question_text}",
+        "question": "Fill in the blank: " + blanked,
         "options": [{"label": chr(65 + i), "text": o} for i, o in enumerate(options)],
         "correctAnswer": correct_label,
-        "correctAnswerText": clean_target
+        "correctAnswerText": target.text,
+        "difficulty": score_difficulty(text),
+        "source": "rule",
     }
 
 
-def generate_questions_from_text(text: str, num_questions: int = 10) -> list:
+def generate_questions_from_text(text, num_questions=10):
+    text = preprocess_text(text)
+    doc = nlp(text)
+    keywords = extract_keywords(doc)
     sentences = get_clean_sentences(text)
-    keywords = extract_keywords(text)
+
     questions = []
     seen = set()
 
-    random.shuffle(sentences)
+    # Step 1: Try T5 ML generation
+    try:
+        ml_questions = generate_questions_t5(sentences, keywords, num_questions=num_questions)
+        for q in ml_questions:
+            if q["question"] not in seen:
+                seen.add(q["question"])
+                questions.append(q)
+        logger.info("T5 generated %d questions", len(questions))
+    except Exception as e:
+        logger.warning("T5 pipeline failed: %s", e)
 
-    for sentence in sentences:
-        if len(questions) >= num_questions:
-            break
-        q = build_definition_question(sentence, keywords) or build_fill_blank_question(sentence, keywords)
-        if q and q["question"] not in seen:
-            seen.add(q["question"])
-            questions.append(q)
+    # Step 2: Fill remaining with spaCy rules
+    if len(questions) < num_questions:
+        clean_doc = nlp(" ".join(sentences))
+        sents = list(clean_doc.sents)
+        random.shuffle(sents)
+
+        for sent in sents:
+            if len(questions) >= num_questions:
+                break
+            q = build_definition_question(sent, keywords) or build_fill_blank_question(sent, keywords)
+            if q and q["question"] not in seen:
+                seen.add(q["question"])
+                questions.append(q)
+
+        logger.info("After spaCy fallback: %d questions total", len(questions))
 
     return questions
 
 
-def generate_quiz(content: str = "", pdf_path: str = None, pdf_url: str = None) -> list:
+def generate_quiz(content="", pdf_path=None, pdf_url=None, num_questions=10):
     text = ""
 
     if pdf_path and os.path.exists(pdf_path):
         try:
             text = extract_text_from_path(pdf_path)
-            print(f"Extracted {len(text)} chars from PDF path")
         except Exception as e:
-            print(f"PDF path extraction failed: {e}")
+            logger.warning("PDF path extraction failed: %s", e)
 
     if not text and pdf_url:
         try:
             text = extract_text_from_url(pdf_url)
         except Exception as e:
-            print(f"PDF url extraction failed: {e}")
+            logger.warning("PDF URL extraction failed: %s", e)
 
     if not text and content:
         text = content
@@ -216,4 +230,4 @@ def generate_quiz(content: str = "", pdf_path: str = None, pdf_url: str = None) 
     if not text:
         return []
 
-    return generate_questions_from_text(text)
+    return generate_questions_from_text(text, num_questions=num_questions)
