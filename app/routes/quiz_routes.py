@@ -1,42 +1,28 @@
 from flask import Blueprint, request, jsonify
-from transformers import pipeline
-import torch
+from app.services.quiz_service import generate_quiz
+import traceback
 
 quiz_bp = Blueprint("quiz", __name__)
 
-MODEL_NAME = "google/flan-t5-base"
-
-generator = pipeline(
-    "text2text-generation",
-    model=MODEL_NAME,
-    device=0 if torch.cuda.is_available() else -1
-)
-
 
 @quiz_bp.route("/generate-quiz", methods=["POST"])
-def generate_quiz():
-    data = request.json
-    content = data.get("content")
+def generate_quiz_route():
+    try:
+        data = request.json
+        content = data.get("content", "")
+        pdf_url = data.get("pdfUrl", None)
+        pdf_path = data.get("pdfPath", None)
 
-    if not content:
-        return jsonify({"error": "No content provided"}), 400
+        if not content and not pdf_url and not pdf_path:
+            return jsonify({"error": "No content, pdfUrl, or pdfPath provided"}), 400
 
-    prompt = f"""
-    Generate 5 multiple choice questions from the following text.
-    Format:
-    Question:
-    A.
-    B.
-    C.
-    D.
-    Answer:
+        questions = generate_quiz(content=content, pdf_path=pdf_path, pdf_url=pdf_url)
 
-    Text:
-    {content}
-    """
+        if not questions:
+            return jsonify({"error": "Could not generate questions from provided input"}), 422
 
-    result = generator(prompt, max_length=512)
+        return jsonify({"success": True, "quiz": questions})
 
-    return jsonify({
-        "quiz": result[0]["generated_text"]
-    })
+    except Exception:
+        traceback.print_exc()
+        return jsonify({"error": "Internal server error"}), 500
